@@ -24,8 +24,18 @@ pub mod feature {
     pub const REPORT_RATE: u16 = 0x8060;
     pub const EXTENDED_REPORT_RATE: u16 = 0x8061;
     pub const ONBOARD_PROFILES: u16 = 0x8100;
+    pub const MOUSE_BUTTON_SPY: u16 = 0x8110;
 }
 use feature::*;
+
+/// The 16-byte 0x8110 remapping table that leaves `count` buttons alone.
+pub fn identity_remap(count: usize) -> [u8; 16] {
+    let mut table = [0u8; 16];
+    for (i, slot) in table.iter_mut().enumerate().take(count.min(16)) {
+        *slot = i as u8 + 1;
+    }
+    table
+}
 
 const TIMEOUT: Duration = Duration::from_millis(1500);
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -554,6 +564,37 @@ impl Device {
         self.call(t, ONBOARD_PROFILES, 1, &[if host { 2 } else { 1 }])?;
         Ok(())
     }
+
+    /// The 0x8110 Mouse Button Spy remapping table: entry i is the button
+    /// that physical button i+1 reports as, 0 meaning "nothing". None when
+    /// the mouse lacks the feature.
+    pub fn button_remap(&self, t: &Transport) -> Result<Option<Vec<u8>>> {
+        if !self.has(MOUSE_BUTTON_SPY) {
+            return Ok(None);
+        }
+        let count = usize::from(self.call(t, MOUSE_BUTTON_SPY, 0, &[])?[0]).min(16);
+        let table = self.call(t, MOUSE_BUTTON_SPY, 3, &[])?;
+        Ok(Some(table[..count].to_vec()))
+    }
+
+    /// Undoes what G HUB leaves behind through 0x8110 Mouse Button Spy. In
+    /// software mode G HUB remaps the buttons it handles to "nothing" and
+    /// listens for them itself, and that table stays in the mouse after G HUB
+    /// quits. Those buttons then do nothing, even in on-board mode, where the
+    /// stored bindings never see them. This stops spying and restores the
+    /// identity table. Returns true when the table had to change.
+    pub fn reset_button_spy(&self, t: &Transport) -> Result<bool> {
+        let Some(current) = self.button_remap(t)? else {
+            return Ok(false);
+        };
+        self.call(t, MOUSE_BUTTON_SPY, 2, &[])?; // stopSpy
+        let identity = identity_remap(current.len());
+        if current == identity[..current.len()] {
+            return Ok(false);
+        }
+        self.call(t, MOUSE_BUTTON_SPY, 4, &identity)?; // setRemapping
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +612,16 @@ mod tests {
     fn parses_discrete_values() {
         let bytes = [0x01, 0x90, 0x03, 0x20, 0x06, 0x40, 0x00, 0x00];
         assert_eq!(parse_dpi_list(&bytes), vec![400, 800, 1600]);
+    }
+
+    #[test]
+    fn identity_remap_maps_each_button_to_itself() {
+        let t = super::identity_remap(11);
+        assert_eq!(&t[..11], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert!(t[11..].iter().all(|&b| b == 0));
+        // What G HUB left on a G502 LIGHTSPEED: buttons 4-9 report nothing.
+        let ghub = [1u8, 2, 3, 0, 0, 0, 0, 0, 0, 3, 3];
+        assert_ne!(&ghub[..], &t[..11]);
     }
 
     #[test]

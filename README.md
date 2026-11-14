@@ -40,6 +40,7 @@ service, and it runs in about 27 MB of RAM from the system tray.
 - **DPI levels and report rate:** up to 5 DPI levels with separate X/Y on supported mice, and report rates up to 8000 Hz.
 - **Per-application profiles:** profiles switch automatically when a linked game or app comes to the foreground, with a Desktop fallback.
 - **On-board memory:** view and edit the profiles stored inside the mouse, which keep working with Open GHub closed. Every write is backed up first and verified by reading it back.
+- **Button assignments:** give buttons keyboard shortcuts (Ctrl+C, Win+Tab and so on), media keys or mouse functions, with a G-Shift layer. They are stored in the mouse, so they work without G HUB or Open GHub running.
 - **Battery:** shows the level in the app and tray, with low-battery notifications at 15% and 5%.
 - **Import from G HUB:** converts your existing G HUB profiles in one click (optional).
 - **Lightweight:** event-driven with no polling. In the tray no WebView runs, so idle CPU is effectively zero.
@@ -115,6 +116,25 @@ Go to **Device settings → On-board memory** to read the profiles stored in the
 mouse. Click the pencil on a slot to change its DPI levels, starting level and
 report rate. Only those bytes change; buttons, lighting and the profile name
 stay exactly as they were.
+
+Open **Assignments** in the left rail to change what the buttons do. Pick a slot and a button,
+then pick a command (for example Copy or Open Task View), press a key
+combination on the Keys tab, or choose a media key or mouse function on the
+Media and System tabs. The **G-Shift** switch edits the second layer, used
+while a button assigned to G-Shift is held. Only the buttons you change are
+written. Assignments run inside the mouse, so they need on-board memory mode.
+Switch to it from Open GHub rather than G HUB: G HUB leaves the buttons it
+handled captured, and Open GHub's switch releases them. They
+can't be macros or application-specific actions, which need software.
+
+If buttons bound to mouse clicks work but keyboard shortcuts do nothing, check
+that Windows has the receiver's keyboard interface enabled: in Device Manager,
+under **Keyboards**, a "HID Keyboard Device" with a warning icon (code 22,
+disabled) blocks every keystroke the mouse sends. G HUB doesn't need that
+interface because it types shortcuts in software, so it can stay disabled
+unnoticed. The Assignments page warns when this is the case and shows the
+command to fix it. Enable it (right-click → Enable device), or from an administrator
+prompt: `pnputil /enable-device "<instance id>"`.
 
 Before every write, Open GHub saves a backup to
 `%APPDATA%\dev.local.openghub\onboard-backups\`. You can restore any backup

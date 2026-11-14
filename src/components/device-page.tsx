@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { Crosshair, Settings, type LucideIcon } from "lucide-react";
+import { Crosshair, MousePointerClick, Settings, type LucideIcon } from "lucide-react";
 
+import { AssignmentsPanel } from "@/components/assignments-panel";
 import { DeviceArt } from "@/components/device-art";
 import { DpiPanel } from "@/components/dpi-panel";
 import { SettingsPanel } from "@/components/settings-panel";
@@ -10,7 +11,7 @@ import type { DeviceState, DeviceSummary, Profile } from "@/lib/api";
 import { levelLabel, levelMatches, type Level } from "@/lib/levels";
 import { cn } from "@/lib/utils";
 
-type Tab = "dpi" | "settings";
+type Tab = "dpi" | "assignments" | "settings";
 
 interface Props {
   device: DeviceSummary;
@@ -49,17 +50,21 @@ export function DevicePage({ device, state, profile, onLevelsChange, onApplyLeve
   const [tab, setTab] = useState<Tab | null>("dpi");
   const toggle = (t: Tab) => setTab((cur) => (cur === t ? null : t));
   const dpi = state?.dpi;
+  const hasOnboard = device.features.some((f) => f.id === 0x8100);
   const levels = profile.levels;
 
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[72px_auto_1fr]">
       <nav className="flex flex-col items-center gap-1 border-r border-border pt-4.5" aria-label="Device features">
         <RailItem icon={Crosshair} label="Sensitivity (DPI)" active={tab === "dpi"} onClick={() => toggle("dpi")} />
+        {hasOnboard && <RailItem icon={MousePointerClick} label="Assignments" active={tab === "assignments"} onClick={() => toggle("assignments")} />}
         <RailItem icon={Settings} label="Device settings" active={tab === "settings"} onClick={() => toggle("settings")} />
       </nav>
 
       {state && tab === "dpi" ? (
         <DpiPanel device={device} state={state} profile={profile} onLevelsChange={onLevelsChange} onApplyLevel={onApplyLevel} onReportRate={onReportRate} onLod={onLod} />
+      ) : state && tab === "assignments" && hasOnboard ? (
+        <AssignmentsPanel device={device} state={state} onModeChange={onModeChange} />
       ) : state && tab === "settings" ? (
         <SettingsPanel device={device} state={state} onModeChange={onModeChange} />
       ) : (

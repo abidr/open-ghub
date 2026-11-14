@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ButtonChange } from "@/lib/bindings";
 
 // Mirrors the Serialize types in src-tauri/src/{main,device}.rs.
 
@@ -179,11 +180,20 @@ export interface OnboardSnapshot {
   rom_profiles: OnboardProfile[];
 }
 
+/** What to change in one slot. DPI levels, start index and report rate go together; buttons are separate. */
 export interface SlotSettings {
   slot: number;
-  dpi_levels: number[];
-  default_index: number;
-  report_rate_hz: number;
+  dpi_levels?: number[];
+  default_index?: number;
+  report_rate_hz?: number;
+  buttons?: ButtonChange[];
+}
+
+/** A keyboard device of the receiver/mouse that Windows isn't running. */
+export interface BlockedKeyboard {
+  instance_id: string;
+  /** 22 = disabled in Device Manager. */
+  problem_code: number;
 }
 
 export interface OnboardWriteResult {
@@ -222,6 +232,8 @@ export const api = {
   importGhub: () => invoke<ImportResult>("import_ghub_profiles"),
 
   onboardSnapshot: (id: string) => invoke<OnboardSnapshot>("onboard_snapshot", { id }),
+  /** `productId` is the hex id from DeviceSummary.product_id (the receiver's, for wireless mice). */
+  blockedKeyboards: (productId: string) => invoke<BlockedKeyboard[]>("blocked_keyboards", { productId }),
   saveOnboardBackup: (id: string, path: string) => invoke<void>("save_onboard_backup", { id, path }),
   writeOnboardSlot: (id: string, settings: SlotSettings) =>
     invoke<OnboardWriteResult>("write_onboard_slot", { id, settings }),

@@ -3,11 +3,30 @@ import { TriangleAlert } from "lucide-react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { cn } from "@/lib/utils";
 
 /** Slide-out side panel used for each device feature (G HUB's left canvas). */
-export function PanelShell({ title, aside, toolbar, children }: { title: string; aside?: string; toolbar?: ReactNode; children: ReactNode }) {
+export function PanelShell({
+  title,
+  aside,
+  toolbar,
+  wide,
+  children,
+}: {
+  title: string;
+  aside?: string;
+  toolbar?: ReactNode;
+  /** For panels with a two-column layout. */
+  wide?: boolean;
+  children: ReactNode;
+}) {
   return (
-    <aside className="flex h-full min-h-0 w-[min(560px,46vw)] flex-col border-r border-border bg-sidebar duration-200 animate-in fade-in slide-in-from-left-4">
+    <aside
+      className={cn(
+        "flex h-full min-h-0 flex-col border-r border-border bg-sidebar duration-200 animate-in fade-in slide-in-from-left-4",
+        wide ? "w-[min(880px,66vw)]" : "w-[min(560px,46vw)]",
+      )}
+    >
       <div className="flex items-baseline justify-between px-7 pt-5.5 pb-2.5">
         <h2 className="text-[22px] font-extrabold tracking-tight uppercase">{title}</h2>
         {aside && <span className="text-xs text-muted-foreground tabular-nums">{aside}</span>}

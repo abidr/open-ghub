@@ -5,6 +5,7 @@ mod device_db;
 mod events;
 mod foreground;
 mod hidpp;
+mod keyboard_iface;
 mod manager;
 mod onboard;
 mod profiles;
@@ -120,7 +121,23 @@ fn set_report_rate(state: State<AppState>, id: String, value: u8) -> Result<(), 
 fn set_onboard_mode(state: State<AppState>, id: String, host: bool) -> Result<(), String> {
     let guard = manager(&state)?;
     let manager = guard.as_ref().expect("manager initialised");
-    manager.with_device(&id, |d, t| d.set_onboard_mode(t, host)).map_err(|e| e.to_string())
+    manager
+        .with_device(&id, |d, t| {
+            d.set_onboard_mode(t, host)?;
+            if !host {
+                // Undo G HUB's button capture so the stored bindings see the
+                // buttons, and make sure the mouse has a stored profile to run.
+                // G HUB would put its table straight back, so leave it alone then.
+                if !ghub_agent_running() {
+                    if let Err(e) = d.reset_button_spy(t) {
+                        eprintln!("could not reset the button remap table: {e}");
+                    }
+                }
+                let _ = d.ensure_active_profile(t);
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
 }
 
 // ---------- profiles ----------
@@ -290,6 +307,13 @@ fn onboard_snapshot(state: State<AppState>, id: String) -> Result<onboard::Snaps
     let guard = manager(&state)?;
     let manager = guard.as_ref().expect("manager initialised");
     manager.with_device(&id, |d, t| d.onboard_snapshot(t).map(|(s, _)| s)).map_err(|e| e.to_string())
+}
+
+/// Keyboard devices of this receiver/mouse that Windows has disabled or failed to start.
+#[tauri::command(async)]
+fn blocked_keyboards(product_id: String) -> Result<Vec<keyboard_iface::BlockedKeyboard>, String> {
+    let pid = u16::from_str_radix(&product_id, 16).map_err(|_| format!("bad product id {product_id}"))?;
+    Ok(keyboard_iface::blocked_keyboards(pid))
 }
 
 /// Writes a backup file: decoded snapshot plus raw sectors (hex).
@@ -604,9 +628,88 @@ fn probe() {
     println!("foreground app: {}", foreground::foreground_exe().unwrap_or_else(|| "(none)".into()));
 }
 
+/// `open-ghub --button-state`: read-only. Prints what decides whether the
+/// mouse runs its stored button bindings: on-board mode, active slot, and the
+/// 0x8110 Mouse Button Spy button count and remapping table.
+fn button_state() {
+    let mut manager = match Manager::new(events::sink()) {
+        Ok(m) => m,
+        Err(e) => return eprintln!("HID init failed: {e}"),
+    };
+    if let Err(e) = manager.scan() {
+        return eprintln!("scan failed: {e}");
+    }
+    let hex = |r: &[u8]| r.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    for d in manager.devices() {
+        let out = manager.with_device(&d.id, |d, t| {
+            let mut out = format!("{}\n", d.name);
+            out += &format!("  mode: {:?}\n", d.onboard_mode(t));
+            if d.has(device::feature::ONBOARD_PROFILES) {
+                out += &format!("  0x8100 getActiveProfile: {:?}\n", d.call(t, device::feature::ONBOARD_PROFILES, 4, &[]).map(|r| hex(&r)));
+            }
+            if d.has(0x8110) {
+                for f in 0..=3u8 {
+                    if f == 1 || f == 2 {
+                        continue; // start/stop spy change state
+                    }
+                    out += &format!("  0x8110 fn{f}: {:?}\n", d.call(t, 0x8110, f, &[]).map(|r| hex(&r)));
+                }
+            }
+            Ok(out)
+        });
+        match out {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("{}: {e}", d.name),
+        }
+    }
+    if manager.devices().is_empty() {
+        println!("no HID++ devices found");
+    }
+}
+
+/// `open-ghub --listen [seconds]`: read-only. Prints every HID++ notification
+/// for a while (default 15 s), with the feature index map, so you can see what
+/// a button press sends.
+fn listen(seconds: u64) {
+    let sink: hidpp::EventSink = std::sync::Arc::new(|event| {
+        if let hidpp::Event::Notification { report, .. } = event {
+            let hex: Vec<String> = report.iter().take(20).map(|b| format!("{b:02x}")).collect();
+            println!("{}", hex.join(" "));
+        }
+    });
+    let mut manager = match Manager::new(sink) {
+        Ok(m) => m,
+        Err(e) => return eprintln!("HID init failed: {e}"),
+    };
+    if let Err(e) = manager.scan() {
+        return eprintln!("scan failed: {e}");
+    }
+    for d in manager.devices() {
+        let mut map: Vec<_> = d.features.values().map(|f| (f.index, f.id)).collect();
+        map.sort();
+        let map: Vec<String> = map.iter().map(|(i, id)| format!("{i:02x}={id:04X}")).collect();
+        println!("{} (device index {:02x}): {}", d.name, d.index, map.join(" "));
+    }
+    println!("listening {seconds}s; press the buttons now");
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    drop(manager);
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--probe") {
         return probe();
+    }
+    // Keyboard devices Windows isn't running: --blocked-keyboards <vid hex> <pid hex>
+    if let Some(pos) = std::env::args().position(|a| a == "--blocked-keyboards") {
+        let arg = |i: usize| std::env::args().nth(pos + i).and_then(|s| u16::from_str_radix(&s, 16).ok());
+        let (Some(vid), Some(pid)) = (arg(1), arg(2)) else { return eprintln!("usage: --blocked-keyboards <vid> <pid>") };
+        return println!("{}", serde_json::to_string_pretty(&keyboard_iface::blocked_keyboards_for(vid, pid)).unwrap_or_default());
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--listen") {
+        return listen(std::env::args().nth(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(15));
+    }
+    if std::env::args().any(|a| a == "--button-state") {
+        return button_state();
     }
     // Read-only: dump on-board profile memory as JSON (and raw sectors to a file).
     if let Some(pos) = std::env::args().position(|a| a == "--onboard-dump") {
@@ -619,9 +722,63 @@ fn main() {
             let [slot, dpis, start, hz, backup] = a.as_slice() else { return Err("usage: --onboard-write <slot> <dpi,..> <start> <hz> <backup.json>".into()) };
             let settings = onboard::SlotSettings {
                 slot: slot.parse().map_err(|_| "bad slot")?,
-                dpi_levels: dpis.split(',').map(|v| v.parse().map_err(|_| "bad dpi")).collect::<Result<_, _>>()?,
-                default_index: start.parse().map_err(|_| "bad start index")?,
-                report_rate_hz: hz.parse().map_err(|_| "bad rate")?,
+                dpi_levels: Some(dpis.split(',').map(|v| v.parse().map_err(|_| "bad dpi")).collect::<Result<_, _>>()?),
+                default_index: Some(start.parse().map_err(|_| "bad start index")?),
+                report_rate_hz: Some(hz.parse().map_err(|_| "bad rate")?),
+                buttons: Vec::new(),
+            };
+            let (snapshot, raw) = d.onboard_snapshot(t).map_err(|e| e.to_string())?;
+            write_onboard_backup(env!("CARGO_PKG_VERSION"), std::path::Path::new(backup), d, &snapshot, &raw)?;
+            let report = d.write_slot_settings(t, &settings).map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
+        });
+    }
+    // Switches mode: --onboard-mode <onboard|host>. Prints the mode and active slot before and after.
+    if let Some(pos) = std::env::args().position(|a| a == "--onboard-mode") {
+        let target = std::env::args().nth(pos + 1).unwrap_or_default();
+        return onboard_cli(move |d, t| {
+            let host = match target.as_str() {
+                "host" => true,
+                "onboard" => false,
+                _ => return Err("usage: --onboard-mode <onboard|host>".into()),
+            };
+            let active = |d: &device::Device, t: &hidpp::Transport| d.call(t, device::feature::ONBOARD_PROFILES, 4, &[]).map(|r| r[1]).map_err(|e| e.to_string());
+            let mode = |d: &device::Device, t: &hidpp::Transport| d.onboard_mode(t).map_err(|e| e.to_string());
+            let remap = |d: &device::Device, t: &hidpp::Transport| d.button_remap(t).map_err(|e| e.to_string());
+            let mut out = format!("before: mode {:?}, active slot {}, button remap {:?}\n", mode(d, t)?, active(d, t)?, remap(d, t)?);
+            d.set_onboard_mode(t, host).map_err(|e| e.to_string())?;
+            if !host {
+                let reset = d.reset_button_spy(t).map_err(|e| e.to_string())?;
+                let slot = d.ensure_active_profile(t).map_err(|e| e.to_string())?;
+                out += &format!("button spy reset: {reset}; ensured slot {slot}\n");
+            }
+            out += &format!("after: mode {:?}, active slot {}, button remap {:?}", mode(d, t)?, active(d, t)?, remap(d, t)?);
+            Ok(out)
+        });
+    }
+    // Rebinds one button (backup first): --onboard-bind <slot> <button 1-based> <default|gshift> '<binding json>' <backup.json>
+    // e.g. --onboard-bind 1 4 default '{"type":"key","modifiers":1,"key":6}' backup.json   (Ctrl+C)
+    if let Some(pos) = std::env::args().position(|a| a == "--onboard-bind") {
+        let a: Vec<String> = std::env::args().skip(pos + 1).take(5).collect();
+        return onboard_cli(|d, t| {
+            let [slot, button, layer, binding, backup] = a.as_slice() else {
+                return Err("usage: --onboard-bind <slot> <button> <default|gshift> '<binding json>' <backup.json>".into());
+            };
+            let button: u8 = button.parse().map_err(|_| "bad button")?;
+            let settings = onboard::SlotSettings {
+                slot: slot.parse().map_err(|_| "bad slot")?,
+                dpi_levels: None,
+                default_index: None,
+                report_rate_hz: None,
+                buttons: vec![onboard::ButtonChange {
+                    index: button.checked_sub(1).ok_or("buttons are numbered from 1")?,
+                    gshift: match layer.as_str() {
+                        "default" => false,
+                        "gshift" => true,
+                        _ => return Err("layer must be default or gshift".into()),
+                    },
+                    binding: serde_json::from_str(binding).map_err(|e| format!("bad binding json: {e}"))?,
+                }],
             };
             let (snapshot, raw) = d.onboard_snapshot(t).map_err(|e| e.to_string())?;
             write_onboard_backup(env!("CARGO_PKG_VERSION"), std::path::Path::new(backup), d, &snapshot, &raw)?;
@@ -708,6 +865,7 @@ fn main() {
             activate_profile,
             import_ghub_profiles,
             onboard_snapshot,
+            blocked_keyboards,
             save_onboard_backup,
             write_onboard_slot,
             restore_onboard_backup,
