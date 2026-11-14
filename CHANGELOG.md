@@ -7,6 +7,26 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- An Assignments page (left rail) for on-board slots: give any button a keyboard shortcut
+  (for example Ctrl+C), a media key, a mouse button or a mouse function such as
+  DPI cycle or G-Shift, in the default layer or the G-Shift layer. The
+  bindings are stored in the mouse, so they work with Open GHub and G HUB
+  closed. Only the buttons you change are written, with the same backup and
+  read-back verification as DPI edits.
+- A warning on the Assignments page when Windows has the receiver's keyboard
+  interface disabled, which silently drops every keystroke binding.
+- `--onboard-bind`, `--onboard-mode`, `--button-state`, `--listen` and
+  `--blocked-keyboards` command-line options.
+
+### Fixed
+
+- Buttons that G HUB had captured (remapped to "nothing" through feature
+  0x8110 so it could run Commands itself) stayed dead after G HUB quit, even in
+  on-board mode. Switching to on-board memory now restores the normal button
+  table.
+
 ## [0.1.2] - 2026-10-20
 
 ### Added

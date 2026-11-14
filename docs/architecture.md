@@ -21,6 +21,7 @@ Open GHub:  React UI ───Tauri invoke──► Rust core (src-tauri) ──
 | `onboard.rs` | On-board memory (`0x8100`): read, patch, write with verification, backup and restore |
 | `events.rs` | Event loop: HID++ notifications, device arrival and removal, battery warnings |
 | `foreground.rs` | Foreground-window hook used by profile auto-switching |
+| `keyboard_iface.rs` | Detects a disabled Windows keyboard interface on the receiver, which drops keystroke bindings |
 | `profiles.rs` | Profile store (`profiles.json`), app matching, G HUB import |
 | `tray.rs` | Tray icon and menu, notifications, creating the window on demand |
 | `settings.rs` | App settings (`settings.json`) |
@@ -76,7 +77,30 @@ Within a profile: report rate at byte 0, default and shift DPI index at 1–2,
 five little-endian DPI values from 3, buttons from `0x20` (16 × 4 bytes),
 G-Shift buttons from `0x60`, and the name from `0xA0`.
 
-A slot write reads the sector, patches only the report rate and DPI bytes,
+Each button binding is 4 bytes (`BindingSpec` in `onboard.rs` is the encoder,
+`decode_binding` the decoder):
+
+| Bytes | Meaning |
+| --- | --- |
+| `80 00 00 00` | No action |
+| `80 01 <mask hi> <mask lo>` | Mouse button (bit n-1 of a big-endian mask) |
+| `80 02 <modifiers> <key>` | Keyboard: HID modifier bits, HID key usage (Ctrl+C is `80 02 01 06`) |
+| `80 03 <usage hi> <usage lo>` | Consumer control (media keys) |
+| `90 <id> 00 00` | Mouse function (DPI, profile, G-Shift, wheel tilt) |
+| `FF FF FF FF` | Disabled |
+
+### G HUB's button capture (0x8110)
+
+To run software Commands, G HUB remaps the buttons it handles to "nothing"
+through Mouse Button Spy (`0x8110`, fn3 getRemapping / fn4 setRemapping,
+one byte per physical button) and catches the raw presses itself. The table
+stays in the mouse after G HUB quits, and those buttons then do nothing in
+either mode, because the on-board bindings never see them. Switching to
+on-board memory in Open GHub stops spying and writes the identity table
+(1, 2, 3, ...), unless G HUB's agent is running.
+
+A slot write reads the sector, patches only the bytes being changed (report
+rate and DPI, and/or the requested button bindings),
 recomputes the CRC, writes, reads back and compares. On a mismatch the
 original sector is written back. Writes to ROM sectors are refused, and so are
 writes while G HUB's agent is running.
@@ -88,6 +112,9 @@ open-ghub.exe --probe                     print devices and settings as JSON (re
 open-ghub.exe --ghub-profiles             print what a G HUB import would produce (read-only)
 open-ghub.exe --onboard-dump [file]       dump on-board memory (read-only)
 open-ghub.exe --onboard-write <slot> <dpi,dpi,..> <start-index> <hz> <backup.json>
+open-ghub.exe --button-state               print mode, active slot and the 0x8110 button remap table (read-only)
+open-ghub.exe --onboard-mode <onboard|host>  switch mode; going on-board also resets the 0x8110 table
+open-ghub.exe --onboard-bind <slot> <button> <default|gshift> '<binding json>' <backup.json>
 open-ghub.exe --onboard-restore <backup.json>
 ```
 

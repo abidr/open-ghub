@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { api, type DeviceSummary, type OnboardButton, type OnboardProfile, type OnboardSnapshot, type SlotSettings } from "@/lib/api";
+import { describeRaw } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 
 /** Buttons that do something other than their own mouse button. */
@@ -31,7 +32,7 @@ function ProfileCard({ profile, active, onEdit }: { profile: OnboardProfile; act
         {profile.crc_valid === false && <Badge variant="destructive">Checksum error</Badge>}
         <span className="ml-auto text-xs text-muted-foreground tabular-nums">{profile.report_rate_hz} Hz</span>
         {onEdit && (
-          <Button variant="ghost" size="icon-sm" aria-label={`Edit slot ${profile.slot}`} onClick={onEdit}>
+          <Button variant="ghost" size="icon-sm" aria-label={`Edit slot ${profile.slot}`} title="DPI and report rate" onClick={onEdit}>
             <Pencil />
           </Button>
         )}
@@ -54,7 +55,7 @@ function ProfileCard({ profile, active, onEdit }: { profile: OnboardProfile; act
         {changed.length === 0 ? (
           "Buttons: standard"
         ) : (
-          <>Buttons: {changed.map((b) => `${profile.buttons.indexOf(b) + 1} → ${b.description}`).join(", ")}</>
+          <>Buttons (edit them under Assignments): {changed.map((b) => `${profile.buttons.indexOf(b) + 1} → ${describeRaw(b.raw)}`).join(", ")}</>
         )}
         {gshift.length > 0 && <> · G-Shift: {gshift.length} assigned</>}
       </div>

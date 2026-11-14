@@ -39,13 +39,90 @@ mod func {
     pub const GET_ACTIVE_DPI_INDEX: u8 = 0xB;
 }
 
-/// New DPI levels, starting level and report rate for one user slot.
+/// Offsets inside a profile sector of the button tables: 16 four-byte
+/// bindings, then the 16 G-Shift bindings.
+const BUTTONS_AT: usize = 0x20;
+const GSHIFT_AT: usize = BUTTONS_AT + 16 * 4;
+const MAX_BUTTONS: usize = 16;
+
+/// A button binding to store. This is the inverse of [`decode_binding`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BindingSpec {
+    /// The button does nothing.
+    None,
+    /// The button is disabled (not even reported to the PC).
+    Disabled,
+    /// A standard mouse button, 1 = left, 2 = right, 3 = middle, 4 = back, 5 = forward.
+    Mouse { button: u8 },
+    /// A keyboard key: HID modifier bitmask plus HID keyboard usage. A key of
+    /// 0 sends the modifiers alone.
+    Key { modifiers: u8, key: u8 },
+    /// A HID consumer-control usage (media keys).
+    Media { usage: u16 },
+    /// A mouse-side function: DPI, profile, G-Shift or wheel tilt. See `SPECIALS`.
+    Special { id: u8 },
+}
+
+impl BindingSpec {
+    /// The 4 bytes stored in the profile.
+    pub fn encode(&self) -> std::result::Result<[u8; 4], String> {
+        match *self {
+            BindingSpec::None => Ok([0x80, 0x00, 0x00, 0x00]),
+            BindingSpec::Disabled => Ok([0xFF; 4]),
+            BindingSpec::Mouse { button } => {
+                if !(1..=16).contains(&button) {
+                    return Err(format!("mouse button {button} is out of range (1-16)"));
+                }
+                let [hi, lo] = (1u16 << (button - 1)).to_be_bytes();
+                Ok([0x80, 0x01, hi, lo])
+            }
+            BindingSpec::Key { modifiers, key } => {
+                if key >= 0xE0 {
+                    return Err(format!("key 0x{key:02x} is a modifier; set it in the modifier mask instead"));
+                }
+                if key == 0 && modifiers == 0 {
+                    return Err("a key binding needs a key or at least one modifier".into());
+                }
+                Ok([0x80, 0x02, modifiers, key])
+            }
+            BindingSpec::Media { usage } => {
+                if usage == 0 {
+                    return Err("a media binding needs a usage code".into());
+                }
+                let [hi, lo] = usage.to_be_bytes();
+                Ok([0x80, 0x03, hi, lo])
+            }
+            BindingSpec::Special { id } => {
+                if id == 0 || usize::from(id) >= SPECIALS.len() {
+                    return Err(format!("special function {id} doesn't exist"));
+                }
+                Ok([0x90, id, 0x00, 0x00])
+            }
+        }
+    }
+}
+
+/// Replaces one button of a slot, in the default layer or the G-Shift layer.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ButtonChange {
+    /// 0-based button index, as in the profile's button table.
+    pub index: u8,
+    #[serde(default)]
+    pub gshift: bool,
+    pub binding: BindingSpec,
+}
+
+/// What to change in one user slot. DPI levels, starting level and report
+/// rate go together: give all three or none. Buttons are independent of them.
 #[derive(Clone, Debug, Deserialize)]
 pub struct SlotSettings {
     pub slot: u8,
-    pub dpi_levels: Vec<u16>,
-    pub default_index: u8,
-    pub report_rate_hz: u32,
+    pub dpi_levels: Option<Vec<u16>>,
+    pub default_index: Option<u8>,
+    pub report_rate_hz: Option<u32>,
+    #[serde(default)]
+    pub buttons: Vec<ButtonChange>,
 }
 
 /// Result of a verified write.
@@ -60,42 +137,55 @@ pub struct WriteReport {
 }
 
 /// Puts `settings` into a copy of a profile sector. Only the report rate,
-/// starting and shift DPI indices and the five DPI values change; buttons,
-/// lighting, power settings and the name are kept byte for byte. The CRC is
+/// starting and shift DPI indices, the five DPI values and the button
+/// bindings that were asked for change; everything else (other buttons,
+/// lighting, power settings, the name) is kept byte for byte. The CRC is
 /// recomputed.
 pub fn patch_profile_sector(original: &[u8], settings: &SlotSettings) -> std::result::Result<Vec<u8>, String> {
-    if original.len() < 0x20 {
+    if original.len() < GSHIFT_AT + MAX_BUTTONS * 4 {
         return Err("sector too small for a profile".into());
     }
-    let levels = &settings.dpi_levels;
-    if levels.is_empty() || levels.len() > 5 {
-        return Err("between 1 and 5 DPI levels are required".into());
-    }
-    if levels.iter().any(|&d| d == 0 || d == 0xFFFF) {
-        return Err("DPI levels must be between 1 and 65534".into());
-    }
-    if usize::from(settings.default_index) >= levels.len() {
-        return Err("the starting level must be one of the DPI levels".into());
-    }
-    let period = (1000 / settings.report_rate_hz.max(1)).min(255) as u8;
-    if !STORABLE_RATES_MS.contains(&period) || 1000 / u32::from(period) != settings.report_rate_hz {
-        return Err(format!(
-            "{} Hz can't be stored on the mouse; use 125, 250, 500 or 1000 Hz",
-            settings.report_rate_hz
-        ));
+    let mut data = original.to_vec();
+
+    match (&settings.dpi_levels, settings.default_index, settings.report_rate_hz) {
+        (None, None, None) => {}
+        (Some(levels), Some(default_index), Some(rate_hz)) => {
+            if levels.is_empty() || levels.len() > 5 {
+                return Err("between 1 and 5 DPI levels are required".into());
+            }
+            if levels.iter().any(|&d| d == 0 || d == 0xFFFF) {
+                return Err("DPI levels must be between 1 and 65534".into());
+            }
+            if usize::from(default_index) >= levels.len() {
+                return Err("the starting level must be one of the DPI levels".into());
+            }
+            let period = (1000 / rate_hz.max(1)).min(255) as u8;
+            if !STORABLE_RATES_MS.contains(&period) || 1000 / u32::from(period) != rate_hz {
+                return Err(format!("{rate_hz} Hz can't be stored on the mouse; use 125, 250, 500 or 1000 Hz"));
+            }
+            data[0] = period;
+            data[1] = default_index;
+            // Keep the shift level valid for the new number of levels.
+            if usize::from(data[2]) >= levels.len() {
+                data[2] = 0;
+            }
+            for i in 0..5 {
+                let value = levels.get(i).copied().unwrap_or(0);
+                data[3 + 2 * i..5 + 2 * i].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        _ => return Err("DPI levels, starting level and report rate must be given together".into()),
     }
 
-    let mut data = original.to_vec();
-    data[0] = period;
-    data[1] = settings.default_index;
-    // Keep the shift level valid for the new number of levels.
-    if usize::from(data[2]) >= levels.len() {
-        data[2] = 0;
+    for change in &settings.buttons {
+        if usize::from(change.index) >= MAX_BUTTONS {
+            return Err(format!("button {} doesn't exist", u16::from(change.index) + 1));
+        }
+        let base = if change.gshift { GSHIFT_AT } else { BUTTONS_AT };
+        let at = base + 4 * usize::from(change.index);
+        data[at..at + 4].copy_from_slice(&change.binding.encode()?);
     }
-    for i in 0..5 {
-        let value = levels.get(i).copied().unwrap_or(0);
-        data[3 + 2 * i..5 + 2 * i].copy_from_slice(&value.to_le_bytes());
-    }
+
     let n = data.len();
     let crc = crc_ccitt(&data[..n - 2]);
     data[n - 2..].copy_from_slice(&crc.to_be_bytes());
@@ -192,7 +282,7 @@ fn hex(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-const SPECIALS: [&str; 12] = [
+const SPECIALS: [&str; 18] = [
     "invalid",
     "Wheel left",
     "Wheel right",
@@ -205,6 +295,12 @@ const SPECIALS: [&str; 12] = [
     "Profile down",
     "Profile cycle",
     "G-Shift",
+    "Battery indicator",
+    "Enable profile",
+    "Performance switch",
+    "Host",
+    "Scroll down",
+    "Scroll up",
 ];
 
 pub fn decode_binding(raw: [u8; 4]) -> ButtonBinding {
@@ -258,8 +354,8 @@ fn parse_profile(slot: u8, sector: u16, rom: bool, enabled: bool, data: &[u8], b
     // Packed layout: rate, default/shift DPI index, 5 x DPI (LE), RGB color,
     // power mode, angle snapping, 10 reserved, powersave/poweroff timeouts,
     // then 16 buttons, 16 G-Shift buttons, a 48-byte name, LEDs, CRC.
-    let buttons_at = 0x20;
-    let gshift_at = buttons_at + 16 * 4;
+    let buttons_at = BUTTONS_AT;
+    let gshift_at = GSHIFT_AT;
     let name_at = gshift_at + 16 * 4;
     let name = decode_name(&data[name_at..name_at + 48]);
     let count = button_count.min(16);
@@ -346,6 +442,34 @@ impl Device {
         Ok(data)
     }
 
+    /// After switching to on-board mode the mouse can have no profile
+    /// selected (it reports 0) and then runs nothing from memory. In that
+    /// case this selects the first enabled user profile. Returns the active
+    /// slot, or 0 when there is none to select.
+    pub fn ensure_active_profile(&self, t: &Transport) -> Result<u8> {
+        let active = self.call(t, ONBOARD_PROFILES, func::GET_ACTIVE_PROFILE, &[])?[1];
+        if active != 0 {
+            return Ok(active);
+        }
+        let info = self.onboard_info(t)?;
+        let directory = self.read_sector(t, DIRECTORY_SECTOR, info.sector_size)?;
+        if !sector_crc_ok(&directory) {
+            return Ok(0);
+        }
+        for i in 0..usize::from(info.profile_count) {
+            let addr = u16::from_be_bytes([directory[4 * i], directory[4 * i + 1]]);
+            if addr == DIRECTORY_END {
+                break;
+            }
+            if directory[4 * i + 2] != 0 {
+                let slot = i as u8 + 1;
+                self.call(t, ONBOARD_PROFILES, func::SET_ACTIVE_PROFILE, &[0, slot])?;
+                return Ok(slot);
+            }
+        }
+        Ok(0)
+    }
+
     /// Reads and decodes the directory, user profiles and ROM profiles.
     pub fn onboard_snapshot(&self, t: &Transport) -> Result<(Snapshot, Vec<RawSector>)> {
         let info = self.onboard_info(t)?;
@@ -429,11 +553,18 @@ impl Device {
         }))
     }
 
-    /// Changes one user slot's DPI levels, starting level and report rate.
+    /// Changes one user slot's DPI levels, starting level, report rate and/or button bindings.
     pub fn write_slot_settings(&self, t: &Transport, settings: &SlotSettings) -> Result<WriteReport> {
         let info = self.onboard_info(t)?;
         if settings.slot == 0 || settings.slot > info.profile_count {
             return Err(Error::Other(format!("slot {} doesn't exist (1–{})", settings.slot, info.profile_count)));
+        }
+        if let Some(b) = settings.buttons.iter().find(|b| b.index >= info.button_count) {
+            return Err(Error::Other(format!(
+                "this mouse has {} buttons; button {} doesn't exist",
+                info.button_count,
+                u16::from(b.index) + 1
+            )));
         }
         let directory = self.read_sector(t, DIRECTORY_SECTOR, info.sector_size)?;
         if !sector_crc_ok(&directory) {
@@ -496,6 +627,14 @@ mod tests {
         assert_eq!(crc_ccitt(b"123456789"), 0x29B1);
     }
 
+    fn dpi_settings(levels: Vec<u16>, index: u8, hz: u32) -> SlotSettings {
+        SlotSettings { slot: 1, dpi_levels: Some(levels), default_index: Some(index), report_rate_hz: Some(hz), buttons: Vec::new() }
+    }
+
+    fn button_settings(buttons: Vec<ButtonChange>) -> SlotSettings {
+        SlotSettings { slot: 1, dpi_levels: None, default_index: None, report_rate_hz: None, buttons }
+    }
+
     fn sample_sector() -> Vec<u8> {
         let mut s = vec![0xFFu8; 255];
         s[0] = 1;
@@ -512,7 +651,7 @@ mod tests {
     #[test]
     fn patch_changes_only_managed_bytes_and_fixes_crc() {
         let original = sample_sector();
-        let settings = SlotSettings { slot: 1, dpi_levels: vec![800, 1600, 3200], default_index: 1, report_rate_hz: 500 };
+        let settings = dpi_settings(vec![800, 1600, 3200], 1, 500);
         let patched = patch_profile_sector(&original, &settings).unwrap();
         assert!(sector_crc_ok(&patched));
         assert_eq!(patched[0], 2); // 500 Hz = 2 ms
@@ -527,12 +666,88 @@ mod tests {
     #[test]
     fn patch_rejects_unstorable_values() {
         let original = sample_sector();
-        let rate = SlotSettings { slot: 1, dpi_levels: vec![800], default_index: 0, report_rate_hz: 8000 };
+        let rate = dpi_settings(vec![800], 0, 8000);
         assert!(patch_profile_sector(&original, &rate).is_err());
-        let index = SlotSettings { slot: 1, dpi_levels: vec![800], default_index: 1, report_rate_hz: 1000 };
+        let index = dpi_settings(vec![800], 1, 1000);
         assert!(patch_profile_sector(&original, &index).is_err());
-        let count = SlotSettings { slot: 1, dpi_levels: vec![1; 6], default_index: 0, report_rate_hz: 1000 };
+        let count = dpi_settings(vec![1; 6], 0, 1000);
         assert!(patch_profile_sector(&original, &count).is_err());
+    }
+
+    #[test]
+    fn binding_encode_round_trips_through_decode() {
+        let cases = [
+            (BindingSpec::None, "none"),
+            (BindingSpec::Disabled, "disabled"),
+            (BindingSpec::Mouse { button: 4 }, "mouse"),
+            (BindingSpec::Key { modifiers: 0x01, key: 0x06 }, "keyboard"),
+            (BindingSpec::Key { modifiers: 0x09, key: 0 }, "keyboard"),
+            (BindingSpec::Media { usage: 0x00CD }, "consumer"),
+            (BindingSpec::Special { id: 5 }, "special"),
+        ];
+        for (spec, kind) in cases {
+            assert_eq!(decode_binding(spec.encode().unwrap()).kind, kind, "{spec:?}");
+        }
+        assert_eq!(decode_binding(BindingSpec::Mouse { button: 5 }.encode().unwrap()).description, "Mouse button 5");
+        assert_eq!(decode_binding(BindingSpec::Mouse { button: 16 }.encode().unwrap()).description, "Mouse button 16");
+        assert_eq!(decode_binding(BindingSpec::Special { id: 5 }.encode().unwrap()).description, "DPI cycle");
+    }
+
+    #[test]
+    fn encodes_ctrl_c_and_ctrl_v() {
+        // Left Ctrl = modifier bit 0; HID usage C = 0x06, V = 0x19.
+        assert_eq!(BindingSpec::Key { modifiers: 0x01, key: 0x06 }.encode().unwrap(), [0x80, 0x02, 0x01, 0x06]);
+        assert_eq!(BindingSpec::Key { modifiers: 0x01, key: 0x19 }.encode().unwrap(), [0x80, 0x02, 0x01, 0x19]);
+    }
+
+    #[test]
+    fn rejects_unstorable_bindings() {
+        assert!(BindingSpec::Mouse { button: 0 }.encode().is_err());
+        assert!(BindingSpec::Mouse { button: 17 }.encode().is_err());
+        assert!(BindingSpec::Key { modifiers: 0, key: 0 }.encode().is_err());
+        assert!(BindingSpec::Key { modifiers: 0, key: 0xE0 }.encode().is_err());
+        assert!(BindingSpec::Media { usage: 0 }.encode().is_err());
+        assert!(BindingSpec::Special { id: 0 }.encode().is_err());
+        assert!(BindingSpec::Special { id: 18 }.encode().is_err());
+    }
+
+    #[test]
+    fn button_patch_changes_only_that_binding_and_fixes_crc() {
+        let original = sample_sector();
+        let change = ButtonChange { index: 3, gshift: false, binding: BindingSpec::Key { modifiers: 0x01, key: 0x06 } };
+        let patched = patch_profile_sector(&original, &button_settings(vec![change])).unwrap();
+        assert!(sector_crc_ok(&patched));
+        let at = BUTTONS_AT + 4 * 3;
+        assert_eq!(&patched[at..at + 4], &[0x80, 0x02, 0x01, 0x06]);
+        // Nothing else moved: DPI block, other buttons, G-Shift table, name.
+        assert_eq!(&patched[..at], &original[..at]);
+        assert_eq!(&patched[at + 4..253], &original[at + 4..253]);
+    }
+
+    #[test]
+    fn gshift_patch_targets_the_gshift_table() {
+        let original = sample_sector();
+        let change = ButtonChange { index: 0, gshift: true, binding: BindingSpec::Media { usage: 0x00E2 } };
+        let patched = patch_profile_sector(&original, &button_settings(vec![change])).unwrap();
+        assert_eq!(&patched[GSHIFT_AT..GSHIFT_AT + 4], &[0x80, 0x03, 0x00, 0xE2]);
+        assert_eq!(&patched[BUTTONS_AT..BUTTONS_AT + 4], &original[BUTTONS_AT..BUTTONS_AT + 4]);
+    }
+
+    #[test]
+    fn button_patch_rejects_bad_index_and_partial_dpi_group() {
+        let original = sample_sector();
+        let change = ButtonChange { index: 16, gshift: false, binding: BindingSpec::None };
+        assert!(patch_profile_sector(&original, &button_settings(vec![change])).is_err());
+        let partial = SlotSettings { slot: 1, dpi_levels: Some(vec![800]), default_index: None, report_rate_hz: None, buttons: Vec::new() };
+        assert!(patch_profile_sector(&original, &partial).is_err());
+    }
+
+    #[test]
+    fn binding_spec_parses_from_the_front_end_json() {
+        let spec: BindingSpec = serde_json::from_str(r#"{"type":"key","modifiers":1,"key":6}"#).unwrap();
+        assert_eq!(spec, BindingSpec::Key { modifiers: 1, key: 6 });
+        let change: ButtonChange = serde_json::from_str(r#"{"index":3,"binding":{"type":"none"}}"#).unwrap();
+        assert!(!change.gshift);
     }
 
     #[test]
